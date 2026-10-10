@@ -17,6 +17,11 @@ Os consoles das abas 4 e 5 têm AUTOCOMPLETE estilo VS Code:
   - Sugere as colunas de cada tabela/view
   - Navegue com ↑ / ↓, confirme com Tab ou Enter, cancele com Esc
 
+RASCUNHOS (aba 4 - Desafios):
+  - O que você digita em cada desafio fica guardado enquanto o app está aberto.
+  - Pode trocar de desafio à vontade: ao voltar, o texto está lá do jeito que você deixou.
+  - Ao fechar o app, ele pergunta se quer salvar os rascunhos em arquivos .sql.
+
 Precisa só do Python (tkinter e sqlite3 já vêm junto).
 No Windows: dois cliques em ABRIR_APP.bat  (ou: py secretaria_digital.py)
 """
@@ -25,7 +30,7 @@ import re
 import sqlite3
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 DB = Path(__file__).with_name("escola.db")
 
@@ -53,18 +58,7 @@ PALAVRAS_SQL = [
 
 
 def carregar_dicionario_sql() -> dict:
-    """Descobre tabelas, views e colunas do banco escola.db.
-
-    Devolve algo como:
-        {
-          "tabelas": ["alunos", "disciplinas", "notas", "frequencia"],
-          "views":   ["boletim", "painel_turma"],
-          "colunas": {
-              "alunos": ["id", "nome", "turma", "idade", "bairro", "atividade"],
-              ...
-          }
-        }
-    """
+    """Descobre tabelas, views e colunas do banco escola.db."""
     info = {"tabelas": [], "views": [], "colunas": {}}
     if not DB.exists():
         return info
@@ -96,7 +90,6 @@ class TextComAutocomplete(tk.Text):
     - Ctrl+Enter executa o callback 'ao_executar' (se definido).
     """
 
-    # quanto tempo (ms) esperar antes de pedir sugestões (evita re-render ao digitar rápido)
     _ATRASO_MS = 60
 
     def __init__(self, master, dicionario: dict, **kwargs):
@@ -109,7 +102,6 @@ class TextComAutocomplete(tk.Text):
         self._indice = -1
         self._ini_palavra = "1.0"
 
-        # lista de sugestões já montada: [palavras-chave] + [tabelas/views] + [colunas]
         self._catalogo = self._montar_catalogo(dicionario)
 
         self.bind("<KeyRelease>", self._ao_soltar_tecla)
@@ -125,7 +117,6 @@ class TextComAutocomplete(tk.Text):
     @staticmethod
     def _montar_catalogo(d: dict) -> list:
         catalogo = []
-        # palavras-chave primeiro (aparecem no topo da lista)
         for p in PALAVRAS_SQL:
             catalogo.append((p, "palavra-chave"))
         for t in d.get("tabelas", []):
@@ -139,7 +130,6 @@ class TextComAutocomplete(tk.Text):
 
     # -- popup -----------------------------------------------------------
     def _ao_soltar_tecla(self, evento):
-        # deixa Ctrl+Enter e setas passarem sem abrir popup
         if evento.keysym in ("Down", "Up", "Tab", "Return", "Escape", "Left", "Right"):
             return
         if evento.state & 0x4:  # Ctrl pressionado
@@ -156,7 +146,6 @@ class TextComAutocomplete(tk.Text):
             palavra = self.get(ini, fim)
         except tk.TclError:
             return
-        # se a "palavra" tiver espaço ou pontuação, não sugerimos nada
         if not palavra or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", palavra):
             self._fechar_popup()
             return
@@ -202,7 +191,6 @@ class TextComAutocomplete(tk.Text):
         self._lista.selection_set(0)
         self._lista.activate(0)
 
-        # posiciona perto do cursor
         try:
             bbox = self.bbox("insert")
         except tk.TclError:
@@ -259,7 +247,6 @@ class TextComAutocomplete(tk.Text):
         return "break"
 
     def _ao_enter(self, evento):
-        # Se o popup está aberto, Enter confirma; senão, Ctrl+Enter executa
         if self._popup and self._sugestoes:
             return self._confirmar()
         if evento.state & 0x4 and self.ao_executar:
@@ -420,6 +407,11 @@ class App(tk.Tk):
 
         self.ultimas_linhas = []
         self.resolvidos = set()
+
+        # rascunhos por desafio: {indice_do_desafio: texto_digitado}
+        # Guarda o que o aluno escreveu para não perder ao trocar de exercício.
+        self.rascunhos: dict[int, str] = {}
+
         self._montar_consulta()
         self._montar_nota()
         self._montar_cadastro()
@@ -427,6 +419,9 @@ class App(tk.Tk):
         self._montar_console()
         self.recarregar_listas()
         self.buscar()
+
+        # pergunta se quer salvar os rascunhos ao fechar (só se houver algo)
+        self.protocol("WM_DELETE_WINDOW", self._ao_fechar_janela)
 
     # ---------- utilidades de tela
     def _caixa_sql(self, pai, titulo="SQL que o app mandou para o banco", altura=6):
@@ -737,7 +732,6 @@ class App(tk.Tk):
         self.lbl_meta = ttk.Label(dir_, foreground="#1F4E79", font=("Arial", 10, "bold"))
         self.lbl_meta.pack(anchor="w", pady=(4, 0))
 
-        # >>> AQUI: o console de desafios agora tem autocomplete <<<
         self.txt_desafio = TextComAutocomplete(
             dir_, dicionario=self.dicionario_sql,
             height=5, font=("Courier New", 11), wrap="word",
@@ -750,6 +744,9 @@ class App(tk.Tk):
         barra.pack(fill="x")
         ttk.Button(barra, text="Testar (Ctrl+Enter)", command=self.testar_desafio).pack(side="left")
         ttk.Button(barra, text="Dica", command=self.dica_desafio).pack(side="left", padx=6)
+        ttk.Button(barra, text="Limpar este desafio",
+                   command=self.limpar_rascunho_atual).pack(side="left", padx=6)
+
         self.lbl_feedback = tk.Label(dir_, font=("Arial", 11, "bold"), anchor="w", justify="left",
                                      wraplength=640, padx=8, pady=6)
         self.lbl_feedback.pack(fill="x", pady=(8, 6))
@@ -764,20 +761,37 @@ class App(tk.Tk):
         self.lista_desafios.delete(0, "end")
         for i, d in enumerate(DESAFIOS):
             marca = "✔" if i in self.resolvidos else "  "
-            self.lista_desafios.insert("end", f"{marca} {i + 1}. {d['titulo']}")
+            # asterisco discreto quando há rascunho salvo nesse desafio
+            tem_rascunho = " *" if self.rascunhos.get(i, "").strip() else ""
+            self.lista_desafios.insert("end", f"{marca} {i + 1}. {d['titulo']}{tem_rascunho}")
             if i in self.resolvidos:
                 self.lista_desafios.itemconfig(i, foreground="#2E7D4F")
-        self.lbl_prog.configure(text=f"{len(self.resolvidos)} de {len(DESAFIOS)} resolvidos")
+        self.lbl_prog.configure(text=f"{len(self.resolvidos)} de {len(DESAFIOS)} resolvidos   "
+                                     "· * = rascunho salvo")
 
     def _referencias(self, d):
         with conectar(somente_leitura=True) as con:
             return [normaliza(con.execute(r).fetchall()) for r in d["respostas"]]
 
+    def _salvar_rascunho_atual(self):
+        """Guarda o texto do desafio aberto antes de trocar de contexto."""
+        if not hasattr(self, "txt_desafio"):
+            return
+        try:
+            texto = self.txt_desafio.get("1.0", "end-1c")
+        except tk.TclError:
+            return
+        self.rascunhos[self.desafio_atual] = texto
+
     def abrir_desafio(self):
         sel = self.lista_desafios.curselection()
         if not sel:
             return
-        self.desafio_atual = sel[0]
+        novo_indice = sel[0]
+        # guarda o que o aluno escreveu no desafio que estava aberto
+        if novo_indice != self.desafio_atual or self.desafio_atual not in self.rascunhos:
+            self._salvar_rascunho_atual()
+        self.desafio_atual = novo_indice
         d = DESAFIOS[self.desafio_atual]
         self.lbl_enunciado.configure(text=f"{self.desafio_atual + 1}. {d['texto']}")
         refs = self._referencias(d)
@@ -789,16 +803,37 @@ class App(tk.Tk):
         if len(refs) > 1:
             meta += "  (Ou um número só, se você usar COUNT.)"
         self.lbl_meta.configure(text=meta)
+
+        # devolve o rascunho guardado (ou vazio, se ainda não mexeu)
         self.txt_desafio.delete("1.0", "end")
+        rascunho = self.rascunhos.get(self.desafio_atual, "")
+        if rascunho:
+            self.txt_desafio.insert("1.0", rascunho)
         self.lbl_feedback.configure(text="", bg=self.cget("bg"))
         for w in self.quadro_desafio.winfo_children():
             w.destroy()
 
+    def limpar_rascunho_atual(self):
+        if not messagebox.askyesno("Limpar", f"Apagar o que você escreveu no desafio "
+                                             f"{self.desafio_atual + 1}?"):
+            return
+        self.txt_desafio.delete("1.0", "end")
+        self.rascunhos[self.desafio_atual] = ""
+        self._atualizar_lista_desafios()
+        self.lista_desafios.selection_set(self.desafio_atual)
+
     def dica_desafio(self):
+        # salva o rascunho antes de mostrar a dica, para não perder nada
+        self._salvar_rascunho_atual()
         self.lbl_feedback.configure(text="Dica: " + DESAFIOS[self.desafio_atual]["dica"],
                                     bg="#FFF2CC", fg="#3D3300")
 
     def testar_desafio(self):
+        # guarda o rascunho também ao testar, para ficar seguro
+        self._salvar_rascunho_atual()
+        self._atualizar_lista_desafios()
+        self.lista_desafios.selection_set(self.desafio_atual)
+
         d = DESAFIOS[self.desafio_atual]
         sql = self.txt_desafio.get("1.0", "end").strip()
         if not sql:
@@ -842,7 +877,6 @@ class App(tk.Tk):
             "dá para consultar à vontade sem estragar nada.  "
             "Autocomplete ativo: comece a digitar e escolha com ↑/↓ + Tab.")).pack(anchor="w")
 
-        # >>> AQUI: o Console SQL agora tem autocomplete <<<
         self.txt_sql = TextComAutocomplete(
             self.aba_sql, dicionario=self.dicionario_sql,
             height=7, font=("Courier New", 11), wrap="word",
@@ -855,6 +889,8 @@ class App(tk.Tk):
         barra = ttk.Frame(self.aba_sql)
         barra.pack(fill="x")
         ttk.Button(barra, text="Executar (Ctrl+Enter)", command=self.executar_console).pack(side="left")
+        ttk.Button(barra, text="Salvar consulta em .sql",
+                   command=self.salvar_consulta_em_arquivo).pack(side="left", padx=(6, 0))
         exemplos = {
             "Tabelas": "SELECT name, type FROM sqlite_master WHERE type IN ('table','view');",
             "Robótica": "SELECT nome, turma FROM alunos WHERE atividade = 'Robótica';",
@@ -871,6 +907,19 @@ class App(tk.Tk):
         self.lbl_console.pack(anchor="w")
         self.quadro_resultado = ttk.Frame(self.aba_sql)
         self.quadro_resultado.pack(fill="both", expand=True)
+
+    def salvar_consulta_em_arquivo(self):
+        sql = self.txt_sql.get("1.0", "end-1c").strip()
+        if not sql:
+            messagebox.showinfo("Salvar", "Nada para salvar no Console.")
+            return
+        destino = filedialog.asksaveasfilename(
+            defaultextension=".sql", initialfile="consulta.sql",
+            filetypes=[("Arquivo SQL", "*.sql"), ("Texto", "*.txt")])
+        if not destino:
+            return
+        Path(destino).write_text(sql + "\n", encoding="utf-8")
+        messagebox.showinfo("Salvar", f"Consulta salva em:\n{destino}")
 
     def executar_console(self):
         sql = self.txt_sql.get("1.0", "end").strip()
@@ -894,6 +943,47 @@ class App(tk.Tk):
         arvore = self._tabela(self.quadro_resultado, [(f"c{i}", n, 110) for i, n in enumerate(nomes)])
         for linha in linhas:
             arvore.insert("", "end", values=[mostra(v) for v in linha])
+
+    # ---------- fechar o app com cuidado
+    def _ao_fechar_janela(self):
+        """Pergunta se o aluno quer salvar os rascunhos antes de fechar.
+
+        Só incomoda se houver algum rascunho não vazio. Nesse caso abre uma
+        pasta e salva um arquivo .sql para cada desafio respondido.
+        """
+        # garante que o desafio aberto entrou no dicionário
+        self._salvar_rascunho_atual()
+        com_conteudo = {i: t for i, t in self.rascunhos.items() if t.strip()}
+        if not com_conteudo:
+            self.destroy()
+            return
+        resposta = messagebox.askyesnocancel(
+            "Sair",
+            f"Você tem rascunho em {len(com_conteudo)} desafio(s).\n\n"
+            "Salvar tudo numa pasta antes de fechar?",
+            parent=self,
+        )
+        if resposta is None:      # cancelou -> não fecha
+            return
+        if resposta:              # sim -> escolhe a pasta e grava
+            pasta = filedialog.askdirectory(
+                title="Escolha a pasta para salvar os rascunhos (.sql)",
+                parent=self,
+            )
+            if not pasta:
+                return
+            pasta = Path(pasta)
+            for i, texto in sorted(com_conteudo.items()):
+                numero = i + 1
+                titulo = DESAFIOS[i]["titulo"].replace("/", "-").replace(":", "-")
+                arquivo = pasta / f"desafio_{numero:02d}_{titulo}.sql"
+                cabecalho = (
+                    f"-- Secretaria Digital — desafio {numero}: {DESAFIOS[i]['titulo']}\n"
+                    f"-- {DESAFIOS[i]['texto']}\n\n"
+                )
+                arquivo.write_text(cabecalho + texto.rstrip() + "\n", encoding="utf-8")
+            messagebox.showinfo("Sair", f"Rascunhos salvos em:\n{pasta}", parent=self)
+        self.destroy()
 
 
 # ----------------------------------------------------------------- correção
