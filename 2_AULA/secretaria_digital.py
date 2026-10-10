@@ -11,10 +11,17 @@ Abas:
   4. Desafios SQL      -> exercícios: a consulta precisa trazer o resultado certo
   5. Console SQL       -> qualquer SELECT, em modo só leitura
 
+Os consoles das abas 4 e 5 têm AUTOCOMPLETE estilo VS Code:
+  - Sugere palavras-chave SQL (SELECT, FROM, WHERE, JOIN, ...)
+  - Sugere tabelas e views do banco (alunos, disciplinas, painel_turma, ...)
+  - Sugere as colunas de cada tabela/view
+  - Navegue com ↑ / ↓, confirme com Tab ou Enter, cancele com Esc
+
 Precisa só do Python (tkinter e sqlite3 já vêm junto).
 No Windows: dois cliques em ABRIR_APP.bat  (ou: py secretaria_digital.py)
 """
 import csv
+import re
 import sqlite3
 import tkinter as tk
 from pathlib import Path
@@ -32,10 +39,236 @@ TURMAS = ["1A", "1B"]
 ATIVIDADES = ["Banda", "Futsal", "Nenhuma", "Robótica", "Teatro"]
 BAIRROS = ["Boqueirão", "Capela Velha", "Centro", "Costeira", "Iguaçu", "Thomaz Coelho"]
 
+# ---------------------------------------------------------------- autocomplete
+# Palavras-chave SQL que serão sugeridas nos consoles (Desafios e Console SQL).
+PALAVRAS_SQL = [
+    "SELECT", "FROM", "WHERE", "AND", "OR", "NOT", "NULL", "IS", "IN", "LIKE",
+    "BETWEEN", "ORDER BY", "GROUP BY", "HAVING", "LIMIT", "OFFSET",
+    "JOIN", "INNER JOIN", "LEFT JOIN", "RIGHT JOIN", "ON",
+    "AS", "DISTINCT", "COUNT", "SUM", "AVG", "MIN", "MAX", "ROUND",
+    "ASC", "DESC", "CASE", "WHEN", "THEN", "ELSE", "END",
+    "INSERT INTO", "VALUES", "UPDATE", "SET", "DELETE FROM",
+    "CREATE TABLE", "CREATE VIEW", "DROP TABLE",
+]
+
+
+def carregar_dicionario_sql() -> dict:
+    """Descobre tabelas, views e colunas do banco escola.db.
+
+    Devolve algo como:
+        {
+          "tabelas": ["alunos", "disciplinas", "notas", "frequencia"],
+          "views":   ["boletim", "painel_turma"],
+          "colunas": {
+              "alunos": ["id", "nome", "turma", "idade", "bairro", "atividade"],
+              ...
+          }
+        }
+    """
+    info = {"tabelas": [], "views": [], "colunas": {}}
+    if not DB.exists():
+        return info
+    try:
+        con = sqlite3.connect(f"file:{DB.as_posix()}?mode=ro", uri=True)
+        try:
+            linhas = con.execute(
+                "SELECT name, type FROM sqlite_master "
+                "WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' "
+                "ORDER BY name"
+            ).fetchall()
+            for nome, tipo in linhas:
+                chave = "views" if tipo == "view" else "tabelas"
+                info[chave].append(nome)
+                colunas = [l[1] for l in con.execute(f"PRAGMA table_info({nome})").fetchall()]
+                info["colunas"][nome] = colunas
+        finally:
+            con.close()
+    except sqlite3.Error:
+        pass
+    return info
+
+
+class TextComAutocomplete(tk.Text):
+    """tk.Text com autocomplete estilo VS Code (palavras-chave + tabelas + colunas).
+
+    - Digite ao menos 1 letra para abrir o popup.
+    - ↑/↓ navegam, Tab ou Enter confirmam, Esc fecha.
+    - Ctrl+Enter executa o callback 'ao_executar' (se definido).
+    """
+
+    # quanto tempo (ms) esperar antes de pedir sugestões (evita re-render ao digitar rápido)
+    _ATRASO_MS = 60
+
+    def __init__(self, master, dicionario: dict, **kwargs):
+        super().__init__(master, **kwargs)
+        self.dicionario = dicionario
+        self.ao_executar = None
+        self._popup = None
+        self._agendado = None
+        self._sugestoes = []
+        self._indice = -1
+        self._ini_palavra = "1.0"
+
+        # lista de sugestões já montada: [palavras-chave] + [tabelas/views] + [colunas]
+        self._catalogo = self._montar_catalogo(dicionario)
+
+        self.bind("<KeyRelease>", self._ao_soltar_tecla)
+        self.bind("<Down>", self._proximo)
+        self.bind("<Up>", self._anterior)
+        self.bind("<Tab>", self._confirmar)
+        self.bind("<Return>", self._ao_enter)
+        self.bind("<Escape>", self._fechar_popup)
+        self.bind("<FocusOut>", lambda e: self._fechar_popup())
+        self.bind("<Button-1>", lambda e: self._fechar_popup())
+
+    # -- catálogo --------------------------------------------------------
+    @staticmethod
+    def _montar_catalogo(d: dict) -> list:
+        catalogo = []
+        # palavras-chave primeiro (aparecem no topo da lista)
+        for p in PALAVRAS_SQL:
+            catalogo.append((p, "palavra-chave"))
+        for t in d.get("tabelas", []):
+            catalogo.append((t, "tabela"))
+        for v in d.get("views", []):
+            catalogo.append((v, "view"))
+        for nome, cols in d.get("colunas", {}).items():
+            for c in cols:
+                catalogo.append((c, "coluna"))
+        return catalogo
+
+    # -- popup -----------------------------------------------------------
+    def _ao_soltar_tecla(self, evento):
+        # deixa Ctrl+Enter e setas passarem sem abrir popup
+        if evento.keysym in ("Down", "Up", "Tab", "Return", "Escape", "Left", "Right"):
+            return
+        if evento.state & 0x4:  # Ctrl pressionado
+            return
+        if self._agendado:
+            self.after_cancel(self._agendado)
+        self._agendado = self.after(self._ATRASO_MS, self._pedir_sugestoes)
+
+    def _pedir_sugestoes(self):
+        self._agendado = None
+        try:
+            ini = self.index("insert -1c wordstart")
+            fim = self.index("insert")
+            palavra = self.get(ini, fim)
+        except tk.TclError:
+            return
+        # se a "palavra" tiver espaço ou pontuação, não sugerimos nada
+        if not palavra or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", palavra):
+            self._fechar_popup()
+            return
+
+        alvo = palavra.lower()
+        matches = []
+        vistos = set()
+        for texto, tipo in self._catalogo:
+            chave = texto.lower()
+            if chave in vistos:
+                continue
+            if chave.startswith(alvo):
+                vistos.add(chave)
+                matches.append((texto, tipo))
+            if len(matches) >= 12:
+                break
+        if not matches:
+            self._fechar_popup()
+            return
+        self._ini_palavra = ini
+        self._sugestoes = matches
+        self._indice = 0
+        self._abrir_popup()
+
+    def _abrir_popup(self):
+        if self._popup is None:
+            self._popup = tk.Toplevel(self)
+            self._popup.wm_overrideredirect(True)
+            self._popup.attributes("-topmost", True)
+            self._lista = tk.Listbox(
+                self._popup, activestyle="none", exportselection=False,
+                font=("Consolas", 10), height=8, width=28,
+                selectbackground="#2A6FDB", selectforeground="white",
+                highlightthickness=1, highlightbackground="#888",
+            )
+            self._lista.pack(fill="both", expand=True)
+            self._lista.bind("<Button-1>", self._clique)
+        self._lista.delete(0, "end")
+        for texto, tipo in self._sugestoes:
+            prefixo = {"palavra-chave": "◆ ", "tabela": "▦ ", "view": "▤ ", "coluna": "· "}.get(tipo, "")
+            self._lista.insert("end", f"{prefixo}{texto}")
+        self._lista.selection_clear(0, "end")
+        self._lista.selection_set(0)
+        self._lista.activate(0)
+
+        # posiciona perto do cursor
+        try:
+            bbox = self.bbox("insert")
+        except tk.TclError:
+            bbox = None
+        if bbox:
+            x = self.winfo_rootx() + bbox[0]
+            y = self.winfo_rooty() + bbox[1] + bbox[3]
+        else:
+            x = self.winfo_rootx() + 20
+            y = self.winfo_rooty() + 20
+        self._popup.wm_geometry(f"+{x}+{y}")
+        self._popup.deiconify()
+
+    def _fechar_popup(self, evento=None):
+        if self._popup is not None:
+            self._popup.destroy()
+            self._popup = None
+        self._sugestoes = []
+        self._indice = -1
+
+    # -- navegação --------------------------------------------------------
+    def _proximo(self, evento=None):
+        if self._popup and self._sugestoes:
+            self._indice = (self._indice + 1) % len(self._sugestoes)
+            self._lista.selection_clear(0, "end")
+            self._lista.selection_set(self._indice)
+            self._lista.activate(self._indice)
+            self._lista.see(self._indice)
+            return "break"
+
+    def _anterior(self, evento=None):
+        if self._popup and self._sugestoes:
+            self._indice = (self._indice - 1) % len(self._sugestoes)
+            self._lista.selection_clear(0, "end")
+            self._lista.selection_set(self._indice)
+            self._lista.activate(self._indice)
+            self._lista.see(self._indice)
+            return "break"
+
+    def _clique(self, evento):
+        idx = self._lista.nearest(evento.y)
+        self._indice = idx
+        self._confirmar()
+        return "break"
+
+    def _confirmar(self, evento=None):
+        if not (self._popup and self._sugestoes):
+            return None
+        texto, _tipo = self._sugestoes[self._indice]
+        self.delete(self._ini_palavra, "insert")
+        self.insert(self._ini_palavra, texto)
+        self.mark_set("insert", f"{self._ini_palavra}+{len(texto)}c")
+        self._fechar_popup()
+        return "break"
+
+    def _ao_enter(self, evento):
+        # Se o popup está aberto, Enter confirma; senão, Ctrl+Enter executa
+        if self._popup and self._sugestoes:
+            return self._confirmar()
+        if evento.state & 0x4 and self.ao_executar:
+            self.ao_executar()
+            return "break"
+        return None
+
+
 # ---------------------------------------------------------------- desafios
-# "respostas" são consultas de referência. O app roda a referência no banco
-# AGORA e compara com o resultado do aluno; assim o desafio continua certo
-# mesmo depois que a turma alterar dados nas outras abas.
 DESAFIOS = [
     {"titulo": "Todos os alunos",
      "texto": "Mostre o nome e a turma de todos os alunos (tabela alunos).",
@@ -74,7 +307,7 @@ DESAFIOS = [
               "da maior nota para a menor.",
      "dica": "No final: ORDER BY logica DESC",
      "respostas": ["SELECT nome, logica FROM painel_turma WHERE logica > 9"],
-     "ordem": (1, True)},   # coluna 2 do resultado, decrescente
+     "ordem": (1, True)},
     {"titulo": "JOIN: notas de Matemática",
      "texto": "Junte a tabela notas com a tabela alunos e mostre o nome do aluno e a nota "
               "de Matemática (disciplina_id = 1).",
@@ -88,7 +321,6 @@ DESAFIOS = [
      "respostas": ["SELECT alunos.nome, disciplinas.nome, notas.nota FROM notas "
                    "JOIN alunos ON alunos.id = notas.aluno_id "
                    "JOIN disciplinas ON disciplinas.id = notas.disciplina_id WHERE notas.nota < 5"]},
-    # ---- desafio final (aba Desafio_Painel da planilha)
     {"titulo": "Painel: 1B em recuperação",
      "texto": "DESAFIO FINAL. Quantos alunos da 1B estão em recuperação? "
               "Vale listar os nomes ou contar com COUNT(*).",
@@ -119,16 +351,13 @@ def conectar(somente_leitura: bool = False) -> sqlite3.Connection:
     if not DB.exists():
         raise FileNotFoundError(f"Não achei o banco em {DB}.\nRode antes:  python criar_banco.py")
     if somente_leitura:
-        # modo "ro": o banco recusa qualquer INSERT/UPDATE/DELETE/DROP
         return sqlite3.connect(f"file:{DB.as_posix()}?mode=ro", uri=True, timeout=5)
     con = sqlite3.connect(DB, timeout=5)
-    con.execute("PRAGMA foreign_keys = ON")  # ativa as regras entre tabelas (e o CASCADE)
+    con.execute("PRAGMA foreign_keys = ON")
     return con
 
 
 def sql_para_exibir(sql: str, params) -> str:
-    """Só para MOSTRAR na tela: troca cada ? pelo valor, do jeito que a gente
-    escreveria no Console SQL. O app executa a versão com ? (parametrizada)."""
     partes = sql.split("?")
     saida = partes[0]
     for valor, resto in zip(params, partes[1:]):
@@ -143,7 +372,6 @@ def mostra(v):
 
 
 def normaliza(linhas):
-    """Deixa o resultado comparável: arredonda números e ignora espaços."""
     saida = []
     for linha in linhas:
         nova = []
@@ -173,6 +401,9 @@ class App(tk.Tk):
         estilo = ttk.Style(self)
         estilo.configure("Treeview", rowheight=24, font=("Arial", 10))
         estilo.configure("Treeview.Heading", font=("Arial", 10, "bold"))
+
+        # descobre tabelas/views/colunas para o autocomplete dos consoles
+        self.dicionario_sql = carregar_dicionario_sql()
 
         abas = ttk.Notebook(self)
         abas.pack(fill="both", expand=True, padx=8, pady=8)
@@ -312,7 +543,6 @@ class App(tk.Tk):
             filetypes=[("CSV (abre no LibreOffice)", "*.csv")])
         if not destino:
             return
-        # ; e utf-8-sig para o LibreOffice/Excel em português abrir certinho
         with open(destino, "w", newline="", encoding="utf-8-sig") as arq:
             w = csv.writer(arq, delimiter=";")
             w.writerow([c[1] for c in COLUNAS_PAINEL])
@@ -386,10 +616,9 @@ class App(tk.Tk):
         sql_up = "UPDATE notas\nSET nota = ?\nWHERE aluno_id = ? AND disciplina_id = ?;"
         sql_ins = "INSERT INTO notas (aluno_id, disciplina_id, nota)\nVALUES (?, ?, ?);"
         try:
-            with conectar() as con:   # o "with" faz o COMMIT sozinho se der tudo certo
+            with conectar() as con:
                 cur = con.execute(sql_up, (nota, aluno_id, disc_id))
                 if cur.rowcount == 0:
-                    # o aluno ainda não tinha nota nessa disciplina: então é INSERT
                     con.execute(sql_ins, (aluno_id, disc_id, nota))
                     mostrado = ("-- o UPDATE não achou nenhuma linha, então o app fez um INSERT:\n"
                                 + sql_para_exibir(sql_ins, [aluno_id, disc_id, nota]))
@@ -507,9 +736,16 @@ class App(tk.Tk):
         self.lbl_enunciado.pack(anchor="w")
         self.lbl_meta = ttk.Label(dir_, foreground="#1F4E79", font=("Arial", 10, "bold"))
         self.lbl_meta.pack(anchor="w", pady=(4, 0))
-        self.txt_desafio = tk.Text(dir_, height=5, font=("Courier New", 11), wrap="word")
+
+        # >>> AQUI: o console de desafios agora tem autocomplete <<<
+        self.txt_desafio = TextComAutocomplete(
+            dir_, dicionario=self.dicionario_sql,
+            height=5, font=("Courier New", 11), wrap="word",
+            undo=True,
+        )
         self.txt_desafio.pack(fill="x", pady=6)
-        self.txt_desafio.bind("<Control-Return>", lambda e: (self.testar_desafio(), "break")[1])
+        self.txt_desafio.ao_executar = self.testar_desafio
+
         barra = ttk.Frame(dir_)
         barra.pack(fill="x")
         ttk.Button(barra, text="Testar (Ctrl+Enter)", command=self.testar_desafio).pack(side="left")
@@ -603,11 +839,19 @@ class App(tk.Tk):
     def _montar_console(self):
         ttk.Label(self.aba_sql, foreground="#595959", text=(
             "Digite um SELECT e aperte Ctrl+Enter. Esta aba abre o banco em modo SÓ LEITURA: "
-            "dá para consultar à vontade sem estragar nada.")).pack(anchor="w")
-        self.txt_sql = tk.Text(self.aba_sql, height=7, font=("Courier New", 11), wrap="word")
+            "dá para consultar à vontade sem estragar nada.  "
+            "Autocomplete ativo: comece a digitar e escolha com ↑/↓ + Tab.")).pack(anchor="w")
+
+        # >>> AQUI: o Console SQL agora tem autocomplete <<<
+        self.txt_sql = TextComAutocomplete(
+            self.aba_sql, dicionario=self.dicionario_sql,
+            height=7, font=("Courier New", 11), wrap="word",
+            undo=True,
+        )
         self.txt_sql.pack(fill="x", pady=6)
         self.txt_sql.insert("1.0", "SELECT nome, turma, idade\nFROM alunos\nWHERE turma = '1A';")
-        self.txt_sql.bind("<Control-Return>", lambda e: (self.executar_console(), "break")[1])
+        self.txt_sql.ao_executar = self.executar_console
+
         barra = ttk.Frame(self.aba_sql)
         barra.pack(fill="x")
         ttk.Button(barra, text="Executar (Ctrl+Enter)", command=self.executar_console).pack(side="left")
@@ -663,7 +907,6 @@ def compara(minhas, ref, ordem=None):
                        "Confira o WHERE.")
     iguais = sorted(map(chave, minhas)) == sorted(map(chave, ref))
     if not iguais:
-        # aceita colunas em outra ordem (ex.: turma, nome em vez de nome, turma)
         iguais = (sorted(tuple(sorted(chave(l))) for l in minhas)
                   == sorted(tuple(sorted(chave(l))) for l in ref))
     if not iguais:
