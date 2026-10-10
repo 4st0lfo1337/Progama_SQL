@@ -1,0 +1,22 @@
+SÁBADO 6 · Dados: da planilha ao banco
+======================================
+Dados 100% fictícios do "Colégio Fictício Pinheiral" (turmas 1A e 1B, 32 alunos).
+
+DOIS CLIQUES
+  VERIFICAR.bat       → confere se a máquina está pronta
+  ABRIR_APP.bat       → abre o app Secretaria Digital
+  RESETAR_BANCO.bat   → volta o banco ao original (desfaz o que a turma alterou)
+
+ARQUIVOS
+  planilha_turma_ALUNO.xlsx   → abre no LibreOffice Calc; complete as células amarelas
+  escola.db                   → o banco de dados (SQLite)
+  secretaria_digital.py       → o app: consultar, lançar nota, cadastro, desafios SQL e console
+  criar_banco.py              → recria o escola.db (usado pelo RESETAR_BANCO.bat)
+  verificar_maquina.py        → usado pelo VERIFICAR.bat
+
+O APP (abas)
+  1. Consultar alunos   SELECT ... WHERE, com o SQL aparecendo embaixo
+  2. Lançar nota        UPDATE (ou INSERT, se o aluno ainda não tem nota)
+  3. Cadastro           INSERT e DELETE
+  4. Desafios SQL       15 exercícios; só marca ✔ se o resultado for exatamente o certo
+  5. Console SQL        qualquer SELECT, em modo só leitura (não estraga nada)
